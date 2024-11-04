@@ -9,14 +9,29 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"reflect"
+	"strconv"
 	"sync"
 	"time"
 
 	"go.uber.org/zap"
 
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/entry"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/operator"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/operator/helper"
 )
+
+// Syslog severity levels
+var severityMapping = [...]entry.Severity{
+	0: entry.Fatal,
+	1: entry.Error3,
+	2: entry.Error2,
+	3: entry.Error,
+	4: entry.Warn,
+	5: entry.Info2,
+	6: entry.Info,
+	7: entry.Debug,
+}
 
 const (
 	ChunkSize        = 1420
@@ -30,19 +45,22 @@ var (
 	magicZlib    = []byte{0x78}
 	magicGzip    = []byte{0x1f, 0x8b}
 )
+
 type Input struct {
 	helper.InputOperator
-	wg              sync.WaitGroup
-	cancel          context.CancelFunc
-	address         string
-	protocol        string
-	conn            net.PacketConn
-	readBufferPool  sync.Pool
-	udpMessageQueue chan UDPMessage
-	wgReader        sync.WaitGroup
-	wgProcessor     sync.WaitGroup
-	asyncReaders    int
-	asyncProcessors int
+	wg                        sync.WaitGroup
+	cancel                    context.CancelFunc
+	address                   string
+	protocol                  string
+	conn                      net.PacketConn
+	udpMessageQueue           chan UDPMessage
+	wgReader                  sync.WaitGroup
+	wgProcessor               sync.WaitGroup
+	asyncReaders              int
+	asyncProcessors           int
+	enableShortAndFullMessage bool
+	enableGELFRawMessage      bool
+	attributePrefix           string
 
 	buffer     map[string]*MapGelfMessage
 	lastBuffer map[string]*MapGelfMessage
@@ -57,18 +75,6 @@ type GELFSegment struct {
 	Data           []byte
 }
 
-type Message struct {
-	Version  string                 `json:"version"`
-	Host     string                 `json:"host"`
-	Short    string                 `json:"short_message"`
-	Full     string                 `json:"full_message,omitempty"`
-	TimeUnix float64                `json:"timestamp"`
-	Level    int32                  `json:"level,omitempty"`
-	Facility string                 `json:"facility,omitempty"`
-	Extra    map[string]interface{} `json:"-"`
-	RawExtra json.RawMessage        `json:"-"`
-}
-
 type UDPMessage struct {
 	length int
 	buffer []byte
@@ -78,6 +84,49 @@ type UDPMessage struct {
 type MapGelfMessage struct {
 	stored   int
 	segments [128][]byte
+}
+
+// Convert any type of attribute to string,
+// at the log site, as well as any fields accumulated on the logger.
+func (gelfRcvInput *Input) convertAnyToString(messsage *map[string]interface{}, key *string) string {
+	var attributeValue string
+	var stringTypeOfAttribute string
+	value, ok := (*messsage)[*key]
+	if !ok {
+		gelfRcvInput.Logger().Error("Key not found in message", zap.String("Key: ", *key))
+		return ""
+	}
+
+	// check if the value is nil, extracted value is set to null in the json
+	if value == nil {
+		return "null"
+	}
+
+	typeOfAttribute := reflect.TypeOf(value)
+	if typeOfAttribute != nil {
+		stringTypeOfAttribute = typeOfAttribute.String()
+	} else {
+		gelfRcvInput.Logger().Error("Failed to get type of attribute", zap.String("Key: ", *key))
+		return ""
+	}
+	gelfRcvInput.Logger().Debug("Type of attribute with key", zap.String("Type: ", stringTypeOfAttribute), zap.String("Key: ", *key))
+	switch stringTypeOfAttribute {
+	case "string":
+		attributeValue = value.(string)
+	case "float", "float64":
+		attributeValue = strconv.FormatFloat(value.(float64), 'g', -1, 64)
+	case "float32":
+		attributeValue = strconv.FormatFloat(float64(value.(float32)), 'g', -1, 32)
+	case "int", "int32", "int64":
+		attributeValue = strconv.Itoa(value.(int))
+	case "bool":
+		attributeValue = strconv.FormatBool(value.(bool))
+	default:
+		gelfRcvInput.Logger().Error("Failed to convert attribute value to string", zap.String("Key: ", *key), zap.String("type: ", stringTypeOfAttribute))
+
+		return ""
+	}
+	return attributeValue
 }
 
 // Start will start listening for messages on a socket.
@@ -140,7 +189,7 @@ func (gelfRcvInput *Input) GelfNewReader(addr string) error {
 }
 
 func (gelfRcvInput *Input) startReading(ctx context.Context) {
-	for n := 0; n < gelfRcvInput.asyncProcessors; n++ {
+	for n := 0; n < gelfRcvInput.asyncReaders; n++ {
 		gelfRcvInput.wgReader.Add(1)
 		go gelfRcvInput.ReadUDPBufferAsync(ctx)
 		gelfRcvInput.Logger().Debug("Started read workers...")
@@ -221,18 +270,7 @@ func (gelfRcvInput *Input) HandleGELFMessage(ctx context.Context, packet []byte,
 
 		gelfRcvInput.handleChunkedMessage(ctx, &segment, n) // Handle as a chunked message
 	} else {
-
-		message, err := gelfRcvInput.extractLog(ctx, packet) // Handle as a full message
-		if err != nil {
-			gelfRcvInput.Logger().Error("Error during decompression(non-chunked)", zap.Error(err))
-			// return nil
-		}
-
-		if message.Full == "" {
-			gelfRcvInput.writeLog(ctx, message.Short)
-		} else {
-			gelfRcvInput.writeLog(ctx, message.Full)
-		}
+		gelfRcvInput.submitLog(ctx, packet) // Handle as a full message
 	}
 }
 
@@ -273,16 +311,7 @@ func (gelfRcvInput *Input) handleChunkedMessage(ctx context.Context, gelfSegment
 						completeLogBytes = append(completeLogBytes, gelfMessage.segments[i]...)
 					}
 
-					message, err := gelfRcvInput.extractLog(ctx, completeLogBytes) // Handle as a full message
-					if err != nil {
-						gelfRcvInput.Logger().Error("Error during decompression(non-chunked)", zap.Error(err))
-					} else {
-						if message.Full == "" {
-							gelfRcvInput.writeLog(ctx, message.Short)
-						} else {
-							gelfRcvInput.writeLog(ctx, message.Full)
-						}
-					}
+					gelfRcvInput.submitLog(ctx, completeLogBytes)
 
 					// Discarding the chunk even if the
 					delete(gelfRcvInput.lastBuffer, gelfSegment.Id)
@@ -317,17 +346,7 @@ func (gelfRcvInput *Input) handleChunkedMessage(ctx context.Context, gelfSegment
 							completeLogBytes = append(completeLogBytes, gelfMessage.segments[i]...)
 						}
 
-						message, err := gelfRcvInput.extractLog(ctx, completeLogBytes) // Handle as a full message
-						if err != nil {
-							gelfRcvInput.Logger().Error("Error during decompression(non-chunked)", zap.Error(err))
-							// return nil
-						} else {
-							if message.Full == "" {
-								gelfRcvInput.writeLog(ctx, message.Short)
-							} else {
-								gelfRcvInput.writeLog(ctx, message.Full)
-							}
-						}
+						gelfRcvInput.submitLog(ctx, completeLogBytes)
 
 						delete(gelfRcvInput.lastBuffer, gelfSegment.Id)
 					}
@@ -356,7 +375,105 @@ func (gelfRcvInput *Input) handleChunkedMessage(ctx context.Context, gelfSegment
 	}
 }
 
-func (gelfRcvInput *Input) extractLog(ctx context.Context, data []byte) (*Message, error) {
+func (gelfRcvInput *Input) submitLog(ctx context.Context, data []byte) {
+
+	var entry *entry.Entry
+
+	var err error
+
+	message, err := gelfRcvInput.extractLogMessage(ctx, data)
+	gelfRcvInput.Logger().Debug("Decompressed GELF ", zap.Any(" message: ", message))
+	if err != nil {
+		gelfRcvInput.Logger().Error("Error during decompression(non-chunked)", zap.Error(err))
+		return // Discard the message
+	} else {
+		// handle log message
+		if val, ok := message["short_message"].(string); ok {
+			entry, err = gelfRcvInput.NewEntry(string(val))
+			if err != nil {
+				gelfRcvInput.Logger().Error("Error creating short_message log entry", zap.Error(err))
+				return
+			}
+		} else if val, ok := message["full_message"].(string); ok {
+			entry, err = gelfRcvInput.NewEntry(string(val))
+			if err != nil {
+				gelfRcvInput.Logger().Error("Error creating full_message log entry", zap.Error(err))
+				return
+			}
+		}
+
+		// handle enableGELFRawMessage
+		if gelfRcvInput.enableGELFRawMessage {
+			jsonData, err := json.Marshal(message)
+			if err != nil {
+				gelfRcvInput.Logger().Error("Error marshalling GELF raw message", zap.Error(err))
+			} else {
+				entry.AddAttribute(gelfRcvInput.attributePrefix+"raw_message", string(jsonData))
+			}
+		}
+
+		// handle standard attributes
+		// standard attributes - host, level, timestamp, level, facility
+		standardAttributes := []string{"version", "host", "timestamp", "level", "facility", "line", "file"}
+		standardAttributesWithMessage := []string{"version", "host", "timestamp", "level", "facility", "line", "file", "short_message", "full_message"}
+
+		var attributes []string
+
+		if gelfRcvInput.enableShortAndFullMessage {
+			attributes = standardAttributesWithMessage
+		} else {
+			attributes = standardAttributes
+		}
+
+		for _, attribute := range attributes {
+
+			if _, ok := message[attribute]; ok {
+				attributeStringValue := gelfRcvInput.convertAnyToString(&message, &attribute)
+				entry.AddAttribute(gelfRcvInput.attributePrefix+attribute, attributeStringValue)
+				switch attribute {
+				case "timestamp":
+					// TODO: Find a way to check for type of timestamp instead of assuming it to be float64
+					typeOfAttribute := reflect.TypeOf(message[attribute])
+					if typeOfAttribute == nil {
+						gelfRcvInput.Logger().Error("Failed to get type of attribute for timestamp")
+						return
+					}
+					switch typeOfAttribute.String() {
+					case "float", "float64":
+						entry.ObservedTimestamp = time.Unix(int64(message[attribute].(float64)), 0)
+						entry.Timestamp = time.Unix(int64(message[attribute].(float64)), 0)
+					case "int", "int32", "int64":
+						entry.ObservedTimestamp = time.Unix(int64(message[attribute].(int)), 0)
+						entry.Timestamp = time.Unix(int64(message[attribute].(int)), 0)
+					}
+				case "level":
+					entry.Severity = severityMapping[int(message[attribute].(float64))]
+				}
+			} else {
+				gelfRcvInput.Logger().Debug("Attribute not found", zap.String("Attribute: ", attribute))
+			}
+		}
+
+		// handle non-standard/additional attributes starting with "_"
+		for k := range message {
+			// Check if key starts with "_" then add to additional attributes, for example _application
+			if string(k[0]) == "_" {
+				attributeStringValue := gelfRcvInput.convertAnyToString(&message, &k)
+				entry.AddAttribute(gelfRcvInput.attributePrefix+k, attributeStringValue)
+				// gelfRcvInput.Logger().Debug("Additional attributes", zap.String("Key: ", k), zap.Any("Value: ", v))
+			}
+		}
+
+		err := gelfRcvInput.Write(ctx, entry)
+		if err != nil {
+			gelfRcvInput.Logger().Error("Error writing log entry", zap.Error(err))
+		}
+
+	}
+
+}
+
+func (gelfRcvInput *Input) extractLogMessage(ctx context.Context, data []byte) (map[string]interface{}, error) {
 
 	var decompressedDataReader io.ReadCloser
 	var reader io.Reader
@@ -380,31 +497,19 @@ func (gelfRcvInput *Input) extractLog(ctx context.Context, data []byte) (*Messag
 	}
 
 	// Write the decompressed message
-	msg := new(Message)
+	var gelfLogEntryRaw map[string]interface{}
 
 	if noCompression {
-		if err := json.NewDecoder(reader).Decode(&msg); err != nil {
+		if err := json.NewDecoder(reader).Decode(&gelfLogEntryRaw); err != nil {
 			return nil, fmt.Errorf("json.Unmarshal: %s", err)
 		}
 	} else {
-
-		if err := json.NewDecoder(decompressedDataReader).Decode(&msg); err != nil {
+		if err := json.NewDecoder(decompressedDataReader).Decode(&gelfLogEntryRaw); err != nil {
 			return nil, fmt.Errorf("json.Unmarshal: %s", err)
 		}
 
 		decompressedDataReader.Close()
 	}
 
-	return msg, nil
-}
-
-func (gelfRcvInput *Input) writeLog(ctx context.Context, logMessage string) {
-
-	entry, err := gelfRcvInput.NewEntry(string(logMessage))
-	if err != nil {
-		gelfRcvInput.Logger().Error("Error creating log entry", zap.Error(err))
-		// return nil
-	}
-
-	gelfRcvInput.Write(ctx, entry)
+	return gelfLogEntryRaw, nil
 }
