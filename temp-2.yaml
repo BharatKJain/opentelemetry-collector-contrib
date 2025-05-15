@@ -1,0 +1,38 @@
+receivers:
+  udplog:
+    listen_address: "0.0.0.0:8888"
+  kafka:
+    topic: applogDefaultProcessed
+    brokers:
+    - c5.kafka-broker.service.intradsm1.sdeconsul.csnzoo.com:9092
+    encoding: json
+    group_id: otel-collector
+
+processors:
+  filter/logs:
+    error_mode: ignore
+    logs:
+      log_record:
+        # - 'IsMatch(body, ".*(so-order-data-fetch-api).*") == 0'
+        - 'body["application"] != "so-order-data-fetch-api"'
+
+exporters:
+  googlecloudpubsub:
+    project: wf-gcp-us-logging-dev
+    topic: "projects/wf-gcp-us-logging-dev/topics/o11y-demo"
+    compression: gzip
+  googlecloud/dev-account:
+    project: wf-gcp-us-logging-dev
+    log:
+      default_log_name: soc-logs
+
+service:
+  pipelines:
+    logs/main:
+      receivers: [kafka]
+      processors: [filter/logs]
+      exporters: [googlecloudpubsub,googlecloud/dev-account]
+    logs/socket:
+      receivers: [udplog]
+      processors: [filter/logs]
+      exporters: [googlecloudpubsub]

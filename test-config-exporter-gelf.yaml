@@ -1,0 +1,39 @@
+receivers:
+  udplog:
+    listen_address: "127.0.0.1:21820"
+
+processors:
+  attributes/common:
+    actions:
+      - key: "DCI"
+        action: "insert"
+        value: "ENV1"
+
+exporters:
+  file/no_rotation:
+    path: ./foo
+  gelfexporter:
+    endpoint: "127.0.0.1:12201"
+    protocol: udp
+    # feature_flags:
+    #   append_gelf_additional_attributes:
+    #     enabled: true
+    #     attributes_prefix: "gelf."
+    #     extract_standard_attributes: true
+    #     extract_additional_attributes: true
+    # Compression can be one of "gzip" or "zlib" or "none"
+    compression: zlib
+    # Maximum chunks allowed is 128, if the number of chunks exceeds this limit, the message will be dropped
+    # send_chunks_with_overflow: true
+    # Default maximum chunk size is 8192 bytes
+    # chunk_size: 2
+    # tcp_timeout_millis: 1000
+service:
+  pipelines:
+    logs/text:
+      receivers: [udplog]
+      processors: [attributes/common]
+      exporters: [file/no_rotation, gelfexporter]
+  telemetry:
+    logs:
+      level: debug

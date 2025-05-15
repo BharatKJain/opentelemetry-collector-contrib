@@ -1,0 +1,53 @@
+receivers:
+  gelfreceiver:
+    # listen_address: "0.0.0.0:21820"
+    listen_address: "0.0.0.0:12201"
+    protocol: udp
+    async_readers: 3
+    async_processors: 3
+    udp_max_queue_length: 10000
+    enable_short_and_full_message: true
+    enable_gelf_raw_message: true
+    # operators:
+    #   - type: regex_parser
+    #     regex: '^(?P<timestamp_field>\d{4}\/\d{2}\/\d{2} \d{2}:\d{2}:\d{2}) (?P<message>[^\]]*)$'
+    #     parse_from: body
+    #     # echo "2024/06/17 10:37:23 {"json":"Hello gray World"}"  >> /dev/udp/0.0.0.0/12201
+    #     # parse_to: attributes["gcp.log_request"]
+    #     timestamp:
+    #       parse_from: body.timestamp_field
+    #       layout_type: strptime
+    #       layout: '%Y/%m/%d %H:%M:%S'
+  udplog:
+    listen_address: "0.0.0.0:12202"
+    operators:
+      - id: request_parser
+        type: regex_parser
+        regex: '^(?P<timestamp_field>\d{4}\/\d{2}\/\d{2} \d{2}:\d{2}:\d{2}) (?P<message>[^\]]*)$'
+        parse_from: body
+        # echo '2024/06/17 10:37:23 {"json":"Hello gray World"}'  >> /dev/udp/0.0.0.0/12202
+        # parse_to: attributes["gcp.http_request"]
+        timestamp:
+          parse_from: body.timestamp_field
+          layout_type: strptime
+          layout: '%Y/%m/%d %H:%M:%S'
+
+exporters:
+  file/no_rotation:
+    path: ./foo
+  googlecloud/dev-account:
+    project: wf-gcp-us-logging-dev
+    log:
+      default_log_name: otel-gelf-testing
+service:
+  pipelines:
+    logs/gelf:
+      receivers: [gelfreceiver]
+      exporters: [file/no_rotation,googlecloud/dev-account]
+    logs/udp:
+      receivers: [udplog]
+      exporters: [file/no_rotation,googlecloud/dev-account]
+  telemetry:
+    logs:
+      level: debug
+
